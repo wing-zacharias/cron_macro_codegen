@@ -87,8 +87,9 @@ dependencies = [
 
 [[package]]
 name = "cron_macro_codegen"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
+ "cron",
  "lazy_static",
  "proc-macro2",
  "quote",

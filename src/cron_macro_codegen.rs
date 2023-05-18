@@ -1,3 +1,4 @@
+use cron::Schedule;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::{quote, ToTokens};
@@ -6,39 +7,14 @@ use std::str::FromStr;
 use syn::{parse_macro_input, AttributeArgs, ItemFn, NestedMeta, ReturnType};
 
 lazy_static::lazy_static! {
-    // static ref CRON_ATTR_REGEX_OF_VALUE:String = r#"
-    // (((^([0-9]|[0-5][0-9])(\\,|\\-|\\/){1}([0-9]|[0-5][0-9]) )|^([0-9]|[0-5][0-9])|^(\\* ))
-    // ((([0-9]|[0-5][0-9])(\\,|\\-|\\/){1}([0-9]|[0-5][0-9]) )|([0-9]|[0-5][0-9])|(\\* ))
-    // ((([0-9]|[0-1][0-9]|2[0-3])(\\,|\\-|\\/){1}([0-9]|[0-1][0-9]|2[0-3]) )|([0-9]|[0-1][0-9]|2[0-3] )|(\\* ))
-    // ((([0-9]|[0-2][0-9]|3[0-1])(\\,|\\-|\\/){1}([0-9]|[0-2][0-9]|3[0-1]) )|(([0-9]|[0-2][0-9]|3[0-1] )|(\\* ))
-    // (([1-7](\\,|\\-|\\/){1}[1-7] )|([1-7]) |(\\? )|(\\* )
-    // ((19[789][0-9]|20[0-9][0-9])\\-(19[789][0-9]|20[0-9][0-9]) )|(\\*))
-    // "#.to_string();
-    // static ref CRON_ATTR_REGEX_OF_VALUE:String = r#"^\s*($|#|\w+\s*=|(\?|\*|(?:[0-5]?\d)(?:(?:-|\/|\,)(?:[0-5]?\d))?(?:,(?:[0-5]?\d)(?:(?:-|\/|\,)(?:[0-5]?\d))?)*)\s+(\?|\*|(?:[0-5]?\d)(?:(?:-|\/|\,)(?:[0-5]?\d))?(?:,(?:[0-5]?\d)(?:(?:-|\/|\,)(?:[0-5]?\d))?)*)\s+(\?|\*|(?:[01]?\d|2[0-3])(?:(?:-|\/|\,)(?:[01]?\d|2[0-3]))?(?:,(?:[01]?\d|2[0-3])(?:(?:-|\/|\,)(?:[01]?\d|2[0-3]))?)*)\s+(\?|\*|(?:0?[1-9]|[12]\d|3[01])(?:(?:-|\/|\,)(?:0?[1-9]|[12]\d|3[01]))?(?:,(?:0?[1-9]|[12]\d|3[01])(?:(?:-|\/|\,)(?:0?[1-9]|[12]\d|3[01]))?)*)\s+(\?|\*|(?:[1-7](?:(?:-|\/|\,)(?:[1-7]))?(?:,(?:[1-7](?:(?:-|\/|\,)(?:[1-7]))?))*)\s+(\?|\*|(?:[1-7](?:(?:-|\/|\,)(?:[1-7]))?(?:,(?:[1-7](?:(?:-|\/|\,)(?:[1-7]))?))*)$"#.to_string();
     static ref CRON_ATTR_REGEX_OF_REF:String = r#"^\$\{(.*?)\}$"#.to_string();
 }
 
-pub(crate) fn find_return_type(target_fn: &ItemFn) -> proc_macro2::TokenStream {
-    let mut return_ty = target_fn.sig.output.to_token_stream();
-    match &target_fn.sig.output {
-        ReturnType::Type(_, b) => {
-            return_ty = b.to_token_stream();
-        }
-        _ => {}
-    }
-    let s = format!("{}", return_ty);
-    if !s.contains(":: Result") && !s.starts_with("Result") {
-        return_ty = quote! {
-             core::Result <#return_ty>
-        };
-    }
-    return_ty
+fn input_and_compile_error(mut item: TokenStream, err: syn::Error) -> TokenStream {
+    let compile_err = TokenStream::from(err.to_compile_error());
+    item.extend(compile_err);
+    item
 }
-
-// pub enum CronAttrType {
-//     QUARTZ,
-//     REF,
-// }
 
 pub struct Args {
     pub cron: syn::LitStr,
@@ -69,17 +45,27 @@ impl Args {
     }
 }
 
-fn input_and_compile_error(mut item: TokenStream, err: syn::Error) -> TokenStream {
-    let compile_err = TokenStream::from(err.to_compile_error());
-    item.extend(compile_err);
-    item
+pub(crate) fn find_return_type(target_fn: &ItemFn) -> proc_macro2::TokenStream {
+    let mut return_ty = target_fn.sig.output.to_token_stream();
+    match &target_fn.sig.output {
+        ReturnType::Type(_, b) => {
+            return_ty = b.to_token_stream();
+        }
+        _ => {}
+    }
+    let s = format!("{}", return_ty);
+    if !s.contains(":: Result") && !s.starts_with("Result") {
+        return_ty = quote! {
+             core::Result <#return_ty>
+        };
+    }
+    return_ty
 }
 
 pub(crate) fn impl_method_cron(attr: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as AttributeArgs);
     let ast = match syn::parse::<ItemFn>(input.clone()) {
         Ok(ast) => ast,
-        // on parse error, make IDEs happy; see fn docs
         Err(err) => return input_and_compile_error(input, err),
     };
     let args = Args::new(args);
@@ -94,12 +80,15 @@ pub(crate) fn impl_method_cron(attr: TokenStream, input: TokenStream) -> TokenSt
     let _func_block = &ast.block;
 
     let reg_ref = Regex::new(CRON_ATTR_REGEX_OF_REF.as_str()).unwrap();
-    // let reg_value = Regex::new(CRON_ATTR_REGEX_OF_VALUE.as_str()).unwrap();
     let _time_of_cron = if reg_ref.is_match(&str_cron) {
         let res = reg_ref.captures(&str_cron).unwrap();
         TokenStream2::from_str(format!("{}.as_str()", res.get(1).unwrap().as_str()).as_str())
             .unwrap()
     } else {
+        if Schedule::try_from(str_cron.as_str()).is_err() {
+            let err_msg = "[cron] Incorrect macro parameter,example  #[cron(\"* */10 * * * *\")],#[cron(\"${CONFIG.cron}\")]!".to_string();
+            panic!("{}", err_msg);
+        }
         quote! {#str_cron}
     };
 
